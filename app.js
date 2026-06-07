@@ -1474,6 +1474,447 @@ function markWorkbookForRecalculation(workbookXml) {
   return workbookXml.replace('</workbook>', '<calcPr calcMode="auto" fullCalcOnLoad="1" forceFullCalc="1"/></workbook>');
 }
 
+
+function xmlEsc(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+function numberToColumnName(num) {
+  let s = '';
+  while (num > 0) {
+    const mod = (num - 1) % 26;
+    s = String.fromCharCode(65 + mod) + s;
+    num = Math.floor((num - 1) / 26);
+  }
+  return s;
+}
+
+function getSheetMaxRowFromCells(cells) {
+  let max = 1;
+  Object.keys(cells).forEach(ref => {
+    const row = Number(ref.replace(/[A-Z]/g, '')) || 1;
+    if (row > max) max = row;
+  });
+  return max;
+}
+
+function getSheetMaxColFromCells(cells) {
+  let max = 1;
+  Object.keys(cells).forEach(ref => {
+    const col = colToNumber(ref.replace(/[0-9]/g, '')) || 1;
+    if (col > max) max = col;
+  });
+  return max;
+}
+
+function makeSheetCell(ref, value = '', styleId = null) {
+  const styleAttr = styleId !== null && styleId !== undefined ? ` s="${styleId}"` : '';
+  if (value === null || value === undefined || value === '') {
+    return `<c r="${ref}"${styleAttr}/>`;
+  }
+  return `<c r="${ref}" t="inlineStr"${styleAttr}><is><t>${xmlEsc(value)}</t></is></c>`;
+}
+
+function addSheetCell(cells, row, col, value = '', styleId = null) {
+  const ref = `${numberToColumnName(col)}${row}`;
+  cells[ref] = { ref, row, col, value, styleId };
+}
+
+function addLineCell(cells, row, col, styleId) {
+  const ref = `${numberToColumnName(col)}${row}`;
+  const existing = cells[ref];
+  addSheetCell(cells, row, col, existing ? existing.value : '', styleId);
+}
+
+function drawHLine(cells, row, col1, col2, styleId) {
+  const from = Math.min(col1, col2);
+  const to = Math.max(col1, col2);
+  for (let c = from; c <= to; c++) addLineCell(cells, row, c, styleId);
+}
+
+function drawVLine(cells, col, row1, row2, styleId) {
+  const from = Math.min(row1, row2);
+  const to = Math.max(row1, row2);
+  for (let r = from; r <= to; r++) addLineCell(cells, r, col, styleId);
+}
+
+function drawBracketConnector(cells, col, rowA, rowB, centerRow, styles, label = '') {
+  const from = Math.min(rowA, rowB);
+  const to = Math.max(rowA, rowB);
+
+  // Match the visual reference more closely:
+  // - no vertical segment above the top competitor line
+  // - the vertical connector starts on the row below the top line
+  // - the bottom endpoint keeps the corner shape
+  if (from === to) {
+    addLineCell(cells, from, col, styles.lineH);
+    if (label !== null && label !== undefined && label !== '') {
+      addSheetCell(cells, centerRow, col, label, styles.text);
+    }
+    return;
+  }
+
+  // Top endpoint: only the horizontal bottom border, without the extra vertical stroke.
+  addLineCell(cells, from, col, styles.lineH);
+
+  // Interior vertical segment.
+  for (let r = from + 1; r < to; r++) {
+    addLineCell(cells, r, col, styles.lineV);
+  }
+
+  // Bottom endpoint.
+  addLineCell(cells, to, col, styles.corner);
+
+  if (label !== null && label !== undefined && label !== '') {
+    let labelStyle = styles.lineV;
+    if (centerRow === from) labelStyle = styles.lineH;
+    else if (centerRow === to) labelStyle = styles.corner;
+    addSheetCell(cells, centerRow, col, label, labelStyle);
+  }
+}
+
+function parseCount(xml, tag) {
+  const match = xml.match(new RegExp(`<${tag}\\b[^>]*\\bcount="(\\d+)"`));
+  return match ? Number(match[1]) : 0;
+}
+
+function appendBracketStyles(stylesXml) {
+  const borderStart = parseCount(stylesXml, 'borders');
+  const xfStart = parseCount(stylesXml, 'cellXfs');
+
+  const borderBottom = `<border><left/><right/><top/><bottom style="medium"><color rgb="FF000000"/></bottom><diagonal/></border>`;
+  const borderRight = `<border><left/><right style="medium"><color rgb="FF000000"/></right><top/><bottom/><diagonal/></border>`;
+  const borderBottomRight = `<border><left/><right style="medium"><color rgb="FF000000"/></right><top/><bottom style="medium"><color rgb="FF000000"/></bottom><diagonal/></border>`;
+  const borderTitleBox = `<border><left style="thin"><color rgb="FF000000"/></left><right style="thin"><color rgb="FF000000"/></right><top style="thin"><color rgb="FF000000"/></top><bottom style="thin"><color rgb="FF000000"/></bottom><diagonal/></border>`;
+
+  let nextXml = stylesXml.replace(/(<borders\b[^>]*\bcount=")\d+("[^>]*>)([\s\S]*?)(<\/borders>)/,
+    (_, a, b, inner, close) => `${a}${borderStart + 4}${b}${inner}${borderBottom}${borderRight}${borderBottomRight}${borderTitleBox}${close}`);
+
+  const xfBottom = `<xf numFmtId="0" fontId="0" fillId="0" borderId="${borderStart}" xfId="0" applyBorder="1"/>`;
+  const xfRight = `<xf numFmtId="0" fontId="0" fillId="0" borderId="${borderStart + 1}" xfId="0" applyBorder="1"/>`;
+  const xfBottomRight = `<xf numFmtId="0" fontId="0" fillId="0" borderId="${borderStart + 2}" xfId="0" applyBorder="1"/>`;
+  const xfTitleBox = `<xf numFmtId="0" fontId="0" fillId="0" borderId="${borderStart + 3}" xfId="0" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf>`;
+
+  nextXml = nextXml.replace(/(<cellXfs\b[^>]*\bcount=")\d+("[^>]*>)([\s\S]*?)(<\/cellXfs>)/,
+    (_, a, b, inner, close) => `${a}${xfStart + 4}${b}${inner}${xfBottom}${xfRight}${xfBottomRight}${xfTitleBox}${close}`);
+
+  return {
+    xml: nextXml,
+    styles: {
+      lineH: xfStart,
+      lineV: xfStart + 1,
+      corner: xfStart + 2,
+      titleBox: xfStart + 3,
+      text: null,
+    },
+  };
+}
+
+function getMatchCenterRow(match, matchRows) {
+  if (matchRows[match.id]) return matchRows[match.id];
+
+  if (match.roundIdx === 0) {
+    const rowA = 5 + match.matchIdx * 4;
+    const rowB = rowA + 2;
+    const center = Math.round((rowA + rowB) / 2);
+    matchRows[match.id] = center;
+    return center;
+  }
+
+  const childA = match.childAId ? matches[match.childAId] : null;
+  const childB = match.childBId ? matches[match.childBId] : null;
+  const rowA = childA ? getMatchCenterRow(childA, matchRows) : 5;
+  const rowB = childB ? getMatchCenterRow(childB, matchRows) : rowA;
+  const center = Math.round((rowA + rowB) / 2);
+  matchRows[match.id] = center;
+  return center;
+}
+
+function splitBracketCompetitorDisplay(rawName) {
+  const text = String(rawName || '').trim();
+  if (!text) return { name: '', team: '' };
+
+  const separators = ['\t', '|', ';'];
+  for (const sep of separators) {
+    if (text.includes(sep)) {
+      const parts = text.split(sep).map(p => p.trim()).filter(Boolean);
+      return { name: parts[0] || text, team: parts.slice(1).join(' ') };
+    }
+  }
+
+  const dashMatch = text.match(/^(.+?)\s+-\s+(.+)$/);
+  if (dashMatch) return { name: dashMatch[1].trim(), team: dashMatch[2].trim() };
+
+  return { name: text, team: '' };
+}
+
+function createBracketWorksheetXml(torneo, categoria, competidores, bracketStyles) {
+  const cells = {};
+  const merges = [];
+  const rowHeights = new Map();
+
+  if (!rounds.length) {
+    const modelo = prepararBracketSegunModelos(competidores);
+    const slots = modelo ? modelo.slots : distribuirCompetidoresConByesBalanceados(competidores);
+    buildMatches(slots);
+  }
+
+  const totalRounds = rounds.length;
+  const baseSize = Math.max(2, (rounds[0] || []).length * 2);
+  const seedOrder = generarOrdenSiembra(baseSize);
+
+  const startRow = 6;
+  const matchSpacing = 4;
+  const seedCol = 1;
+  const nameCol = 2;
+  const teamCol = 4;
+  const firstLineEndCol = 5;
+
+  // Layout inspired by the reference image provided by the user.
+  const roundLayout = [
+    // Layout calibrated to match the Excel reference provided by the user:
+    // B:E competitors  -> F connector -> G:I winner
+    // G:I winners      -> J connector -> K:M winner
+    // K:M winners      -> N connector -> O:P winner
+    // O:P winners      -> Q connector -> R:V champion output line
+    { labelCol: 2,  connCol: 6,  winnerStart: 7,  winnerEnd: 9  }, // OCTAVOS -> CUARTOS
+    { labelCol: 6,  connCol: 10, winnerStart: 11, winnerEnd: 13 }, // CUARTOS -> SEMIFINAL
+    { labelCol: 10, connCol: 14, winnerStart: 15, winnerEnd: 16 }, // SEMIFINAL -> FINAL
+    { labelCol: 14, connCol: 17, winnerStart: 18, winnerEnd: 22 }, // FINAL -> salida campeón
+    // Extra round for larger brackets if needed.
+    { labelCol: 18, connCol: 24, winnerStart: 25, winnerEnd: 29 },
+  ];
+
+  addSheetCell(cells, 1, 1, torneo || 'Torneo de Taekwondo');
+  if (categoria) addSheetCell(cells, 2, 1, categoria);
+  merges.push('A1:F1');
+  if (categoria) merges.push('A2:F2');
+
+  const roundNames = rounds.map((_, ri) => nombreRonda(totalRounds - 1 - ri).toUpperCase());
+  roundNames.forEach((name, ri) => {
+    const layout = roundLayout[ri];
+    if (!layout) return;
+    addSheetCell(cells, 4, layout.labelCol, name, bracketStyles.text);
+  });
+
+  const matchRows = {};
+  const getCenterRow = (match) => {
+    if (matchRows[match.id]) return matchRows[match.id];
+    if (match.roundIdx === 0) {
+      const rowA = startRow + match.matchIdx * matchSpacing;
+      const rowB = rowA + 2;
+      const center = Math.round((rowA + rowB) / 2);
+      matchRows[match.id] = center;
+      return center;
+    }
+    const childA = match.childAId ? matches[match.childAId] : null;
+    const childB = match.childBId ? matches[match.childBId] : null;
+    const rowA = childA ? getCenterRow(childA) : startRow;
+    const rowB = childB ? getCenterRow(childB) : rowA;
+    const center = Math.round((rowA + rowB) / 2);
+    matchRows[match.id] = center;
+    return center;
+  };
+
+  const fillCompetitorSegment = (row, colStart, colEnd, rawName, withSeed = false, slotIndex = 0) => {
+    const display = splitBracketCompetitorDisplay(rawName);
+    const shown = rawName ? display.name : 'BYE';
+    if (withSeed) {
+      const seed = rawName ? seedOrder[slotIndex] : '';
+      addSheetCell(cells, row, seedCol, seed, bracketStyles.text);
+    }
+    for (let c = colStart; c <= colEnd; c++) addLineCell(cells, row, c, bracketStyles.lineH);
+    addSheetCell(cells, row, colStart, shown, bracketStyles.lineH);
+    if (display.team && colStart + 2 <= colEnd) addSheetCell(cells, row, Math.min(colStart + 2, colEnd), display.team, bracketStyles.lineH);
+    rowHeights.set(row, 20);
+  };
+
+  // First round competitors.
+  (rounds[0] || []).forEach(matchId => {
+    const match = matches[matchId];
+    const rowA = startRow + match.matchIdx * matchSpacing;
+    const rowB = rowA + 2;
+    fillCompetitorSegment(rowA, nameCol, firstLineEndCol, match.slotA, true, match.matchIdx * 2);
+    fillCompetitorSegment(rowB, nameCol, firstLineEndCol, match.slotB, true, match.matchIdx * 2 + 1);
+  });
+
+  const writeAdvancedWinner = (row, roundIndex, rawName) => {
+    if (!rawName) return;
+    const layout = roundLayout[roundIndex];
+    if (!layout) return;
+    fillCompetitorSegment(row, layout.winnerStart, layout.winnerEnd, rawName, false, 0);
+  };
+
+  rounds.forEach((roundIds, ri) => {
+    const layout = roundLayout[ri];
+    if (!layout) return;
+
+    roundIds.forEach((matchId, idxInRound) => {
+      const match = matches[matchId];
+      const matchNo = String((ri === 0 ? 0 : (rounds[ri - 1]?.length || 0)) + idxInRound + 1);
+      const center = getCenterRow(match);
+      let rowA, rowB;
+
+      if (ri === 0) {
+        rowA = startRow + match.matchIdx * matchSpacing;
+        rowB = rowA + 2;
+        drawBracketConnector(cells, layout.connCol, rowA, rowB, center, bracketStyles, matchNo);
+        if (ri < totalRounds - 1) writeAdvancedWinner(center, ri, match.winner);
+      } else {
+        const childA = match.childAId ? matches[match.childAId] : null;
+        const childB = match.childBId ? matches[match.childBId] : null;
+        rowA = childA ? getCenterRow(childA) : center;
+        rowB = childB ? getCenterRow(childB) : center;
+        const prevLayout = roundLayout[ri - 1];
+
+        // Connect from previous winner line end to current connector
+        drawHLine(cells, rowA, prevLayout.winnerEnd, layout.connCol, bracketStyles.lineH);
+        drawHLine(cells, rowB, prevLayout.winnerEnd, layout.connCol, bracketStyles.lineH);
+        drawBracketConnector(cells, layout.connCol, rowA, rowB, center, bracketStyles, matchNo);
+        if (ri < totalRounds - 1) writeAdvancedWinner(center, ri, match.winner);
+      }
+    });
+  });
+
+  // Draw a final output line and winner, without the big champion box.
+  const finalMatchId = rounds.length ? rounds[rounds.length - 1][0] : null;
+  if (finalMatchId && matches[finalMatchId]) {
+    const finalMatch = matches[finalMatchId];
+    const center = getCenterRow(finalMatch);
+    const finalLayout = roundLayout[Math.min(totalRounds - 1, roundLayout.length - 1)];
+    const outputStart = finalLayout.winnerStart;
+    const outputEnd = finalLayout.winnerEnd;
+    drawHLine(cells, center, outputStart, outputEnd, bracketStyles.lineH);
+    if (finalMatch.winner) addSheetCell(cells, center, outputEnd + 1, splitBracketCompetitorDisplay(finalMatch.winner).name, bracketStyles.text);
+  }
+
+  const maxRow = Math.max(38, getSheetMaxRowFromCells(cells) + 2);
+  const maxCol = Math.max(23, getSheetMaxColFromCells(cells) + 1);
+
+  const rows = [];
+  for (let r = 1; r <= maxRow; r++) {
+    const heightAttr = rowHeights.has(r) ? ` ht="${rowHeights.get(r)}" customHeight="1"` : '';
+    const rowCells = Object.values(cells)
+      .filter(cell => cell.row === r)
+      .sort((a, b) => a.col - b.col)
+      .map(cell => makeSheetCell(cell.ref, cell.value, cell.styleId))
+      .join('');
+    rows.push(`<row r="${r}"${heightAttr}>${rowCells}</row>`);
+  }
+
+  const cols = [];
+  for (let c = 1; c <= maxCol; c++) {
+    let width = 6;
+    if (c === 1) width = 4;
+    else if (c >= 2 && c <= 5) width = 10;
+    else if (c === 6 || c === 10 || c === 14 || c === 17 || c === 24) width = 5;
+    else width = 8;
+    cols.push(`<col min="${c}" max="${c}" width="${width}" customWidth="1"/>`);
+  }
+
+  const mergeXml = merges.length
+    ? `<mergeCells count="${merges.length}">${merges.map(ref => `<mergeCell ref="${ref}"/>`).join('')}</mergeCells>`
+    : '';
+
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <dimension ref="A1:${numberToColumnName(maxCol)}${maxRow}"/>
+  <sheetViews><sheetView workbookViewId="0"/></sheetViews>
+  <sheetFormatPr defaultRowHeight="15"/>
+  <cols>${cols.join('')}</cols>
+  <sheetData>${rows.join('')}</sheetData>
+  ${mergeXml}
+  <pageMargins left="0.3" right="0.3" top="0.4" bottom="0.4" header="0.2" footer="0.2"/>
+  <pageSetup orientation="landscape" paperSize="9" fitToWidth="1" fitToHeight="0"/>
+</worksheet>`;
+}
+
+function getWorksheetSheetNumberList(zip) {
+  return Object.keys(zip.files)
+    .map(name => {
+      const match = name.match(/^xl\/worksheets\/sheet(\d+)\.xml$/);
+      return match ? Number(match[1]) : null;
+    })
+    .filter(n => n !== null);
+}
+
+function getNextRelationshipId(relsXml) {
+  const ids = Array.from(relsXml.matchAll(/Id="rId(\d+)"/g)).map(m => Number(m[1]));
+  return `rId${Math.max(0, ...ids) + 1}`;
+}
+
+function getNextSheetId(workbookXml) {
+  const ids = Array.from(workbookXml.matchAll(/sheetId="(\d+)"/g)).map(m => Number(m[1]));
+  return Math.max(0, ...ids) + 1;
+}
+
+function getWorkbookSheetInfo(workbookXml, relsXml, sheetName) {
+  const sheetRe = new RegExp(`<sheet\\b[^>]*\\bname="${sheetName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"[^>]*\\br:id="([^"]+)"[^>]*/?>`);
+  const sheetMatch = workbookXml.match(sheetRe);
+  if (!sheetMatch) return null;
+
+  const rid = sheetMatch[1];
+  const relRe = new RegExp(`<Relationship\\b[^>]*\\bId="${rid}"[^>]*\\bTarget="([^"]+)"[^>]*/?>`);
+  const relMatch = relsXml.match(relRe);
+  if (!relMatch) return null;
+
+  return {
+    rid,
+    target: relMatch[1],
+    path: `xl/${relMatch[1].replace(/^\//, '')}`,
+  };
+}
+
+async function ensureWorksheetContentType(zip, sheetPath) {
+  const contentTypesFile = zip.file('[Content_Types].xml');
+  if (!contentTypesFile) return;
+
+  const partName = `/${sheetPath}`;
+  const contentTypesXml = await contentTypesFile.async('text');
+  if (contentTypesXml.includes(`PartName="${partName}"`)) return;
+
+  const override = `<Override PartName="${partName}" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`;
+  zip.file('[Content_Types].xml', contentTypesXml.replace('</Types>', `${override}</Types>`));
+}
+
+async function addBracketSheetToWorkbook(zip, workbookXml, relsXml, competidores, torneo, categoria) {
+  const stylesFile = zip.file('xl/styles.xml');
+  if (!stylesFile) return workbookXml;
+
+  const stylesXml = await stylesFile.async('text');
+  const styled = appendBracketStyles(stylesXml);
+  zip.file('xl/styles.xml', styled.xml);
+
+  let nextWorkbookXml = workbookXml;
+  let nextRelsXml = relsXml;
+  const bracketName = 'BRACKET';
+  let info = getWorkbookSheetInfo(nextWorkbookXml, nextRelsXml, bracketName);
+  let sheetPath = info ? info.path : '';
+
+  if (!info) {
+    const nextSheetNumber = Math.max(0, ...getWorksheetSheetNumberList(zip)) + 1;
+    const nextSheetId = getNextSheetId(nextWorkbookXml);
+    const nextRid = getNextRelationshipId(nextRelsXml);
+    sheetPath = `xl/worksheets/sheet${nextSheetNumber}.xml`;
+
+    nextRelsXml = nextRelsXml.replace('</Relationships>',
+      `<Relationship Id="${nextRid}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${nextSheetNumber}.xml"/></Relationships>`);
+    nextWorkbookXml = nextWorkbookXml.replace('</sheets>',
+      `<sheet name="${bracketName}" sheetId="${nextSheetId}" r:id="${nextRid}"/></sheets>`);
+    zip.file('xl/_rels/workbook.xml.rels', nextRelsXml);
+    await ensureWorksheetContentType(zip, sheetPath);
+  }
+
+  const bracketXml = createBracketWorksheetXml(torneo, categoria, competidores, styled.styles);
+  zip.file(sheetPath, bracketXml);
+  return nextWorkbookXml;
+}
+
 function patchSheetXmlForExport(sheetXml, competidores, categoriaEdad, genero) {
   let nextXml = patchCompetitorRows(sheetXml, competidores.slice(0, EXCEL_MAX_ROWS), categoriaEdad, genero, '');
   nextXml = ensureKyoruguiKgDropdown(nextXml);
@@ -1518,7 +1959,15 @@ async function exportarCompetidoresExcel() {
     const sheetXml = await zip.file(sheetPath).async('text');
     const patchedSheetXml = patchSheetXmlForExport(sheetXml, competidores, categoriaEdad, genero);
     zip.file(sheetPath, patchedSheetXml);
-    zip.file('xl/workbook.xml', markWorkbookForRecalculation(workbookXml));
+    const bracketWorkbookXml = await addBracketSheetToWorkbook(
+      zip,
+      workbookXml,
+      relsXml,
+      competidores,
+      document.getElementById('torneoNombre').value.trim() || 'Torneo de Taekwondo',
+      getCategoriaDisplay()
+    );
+    zip.file('xl/workbook.xml', markWorkbookForRecalculation(bracketWorkbookXml));
     await removeCalcChain(zip);
 
     const torneo = document.getElementById('torneoNombre').value.trim() || 'torneo-taekwondo';
